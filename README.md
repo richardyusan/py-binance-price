@@ -21,7 +21,13 @@ Pure Python standard library (Tkinter + `http.client`): no `pip install`, starts
 
 ![Chart with Bollinger Bands, MA, RSI and MACD](docs/screenshots/chart.png)
 
-## Requirements
+## Download (Windows exe)
+
+Get **`BinancePriceViewer.exe`** from the [latest release](https://github.com/richardyusan/py-binance-price/releases/latest). It's a single file and doesn't need Python. Put it in any folder and run it. `config.json` is saved next to the exe.
+
+> The exe isn't code-signed, so Windows SmartScreen may show "Windows protected your PC". Click **More info → Run anyway**, or run from source as described below.
+
+## Requirements (running from source)
 
 - Windows 10/11 (also runs on macOS/Linux with Python + Tk)
 - [Python 3.9+](https://www.python.org/downloads/) with **tcl/tk** and the **py launcher**. Both are selected by default in the Windows installer.
@@ -47,6 +53,14 @@ Then start it any of these ways:
 ```powershell
 powershell -ExecutionPolicy Bypass -File create_shortcut.ps1
 ```
+
+### Building the exe
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_exe.ps1
+```
+
+The script installs PyInstaller into an isolated `.venv-build`, embeds the icon and version info, and writes `dist\BinancePriceViewer.exe` and `dist\BinancePriceViewer-<version>-win64.zip`.
 
 ## Usage
 
@@ -127,6 +141,7 @@ BinancePriceViewer.pyw   console-less launcher (double-click)
 run.bat                  batch launcher using the py launcher
 create_shortcut.ps1      creates Desktop / Start Menu shortcuts
 make_icon.ps1            regenerates icon.ico / icon.png
+build_exe.ps1            builds the standalone exe with PyInstaller
 docs/screenshots/        README images
 ```
 

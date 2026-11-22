@@ -10,3 +10,6 @@ config.json
 build/
 dist/
 *.spec
+
+# Build environment
+.venv-build/
