@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.tmp
+
+# Personal settings (favorites, window size, DNS choice). The app creates
+# config.json in its folder when you save.
+config.json
+
+# Build output (e.g. PyInstaller)
+build/
+dist/
+*.spec
