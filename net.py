@@ -12,12 +12,17 @@ Networking for Binance Price Viewer (standard library only).
 
 from __future__ import annotations
 
+import base64
+import fnmatch
+import gzip
 import http.client
 import json
+import os
 import random
 import socket
 import ssl
 import struct
+import sys
 import threading
 import time
 from decimal import Decimal
@@ -25,6 +30,17 @@ from decimal import Decimal
 USER_AGENT = "binance-price-viewer/1.1"
 MAX_SYMBOLS_PER_REQUEST = 100
 MIN_REFRESH_MS = 250
+
+# Approximate HTTP traffic of this session (bodies + headers, excluding TLS).
+TRAFFIC = {"down": 0, "up": 0, "requests": 0}
+_traffic_lock = threading.Lock()
+
+
+def _count_traffic(down: int, up: int):
+    with _traffic_lock:
+        TRAFFIC["down"] += down
+        TRAFFIC["up"] += up
+        TRAFFIC["requests"] += 1
 
 # key -> (label, [server IPs])
 DNS_PROVIDERS: dict[str, tuple[str, list[str]]] = {
@@ -213,6 +229,8 @@ class Resolver:
             text = f"{servers} ({MODE_SHORT[self.mode]})"
         else:
             text = f"{name} {servers} ({MODE_SHORT[self.mode]})"
+        if self.active:
+            return f"{DNS_PROVIDERS[self.active][0]} ({MODE_SHORT[self.mode]}, fallback from {name})"
         return text + (" + auto fallback" if self.fallback else "")
 
     def _candidates(self, provider: str):
@@ -271,15 +289,214 @@ class Resolver:
             self._cache.pop(host, None)
 
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPS connection to a pre-resolved IP; SNI + cert check use the hostname."""
+# --------------------------------------------------------------------------
+# Proxy support (HTTP CONNECT and SOCKS5), standard library only
+# --------------------------------------------------------------------------
+PROXY_TYPES = {
+    "none": "No proxy (direct connection)",
+    "system": "Use Windows system proxy",
+    "http": "HTTP / HTTPS proxy (CONNECT)",
+    "socks5": "SOCKS5 proxy",
+}
+_SOCKS5_ERRORS = {1: "general failure", 2: "not allowed by ruleset", 3: "network unreachable",
+                  4: "host unreachable", 5: "connection refused", 6: "TTL expired",
+                  7: "command not supported", 8: "address type not supported"}
 
-    def __init__(self, host: str, ip: str, timeout: float):
+
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("proxy closed the connection")
+        buf += chunk
+    return buf
+
+
+class Proxy:
+    """An HTTP (CONNECT) or SOCKS5 proxy. With `remote_dns` the proxy resolves
+    the Binance hostname itself, so no local DNS lookup is needed at all."""
+
+    def __init__(self, kind: str, host: str, port: int, user: str = "", password: str = "",
+                 remote_dns: bool = True, source: str = ""):
+        self.kind = kind            # "http" | "socks5"
+        self.host = host
+        self.port = int(port)
+        self.user = user
+        self.password = password
+        self.remote_dns = remote_dns
+        self.source = source        # "system" when read from Windows settings
+
+    @property
+    def label(self) -> str:
+        name = "HTTP proxy" if self.kind == "http" else "SOCKS5 proxy"
+        return f"{name} {self.host}:{self.port}" + (" (system)" if self.source == "system" else "")
+
+    def open(self, host: str, port: int, ip: str | None, timeout: float) -> socket.socket:
+        """Return a TCP socket tunnelled through the proxy to host:port."""
+        target = host if (self.remote_dns or not ip) else ip
+        try:
+            sock = socket.create_connection((self.host, self.port), timeout)
+        except OSError as e:
+            raise OSError(f"cannot reach {self.label}: {e}") from None
+        try:
+            if self.kind == "socks5":
+                self._socks5(sock, target, port)
+            else:
+                self._http_connect(sock, target, port)
+        except Exception:
+            sock.close()
+            raise
+        return sock
+
+    def _http_connect(self, sock, target: str, port: int):
+        lines = [f"CONNECT {target}:{port} HTTP/1.1", f"Host: {target}:{port}",
+                 f"User-Agent: {USER_AGENT}", "Proxy-Connection: keep-alive"]
+        if self.user:
+            cred = base64.b64encode(f"{self.user}:{self.password}".encode()).decode()
+            lines.append(f"Proxy-Authorization: Basic {cred}")
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise OSError(f"{self.label} closed the connection")
+            buf += chunk
+            if len(buf) > 65536:
+                raise OSError(f"{self.label}: response header too large")
+        status = buf.split(b"\r\n", 1)[0].decode("latin-1").strip()
+        parts = status.split(" ", 2)
+        if len(parts) < 2 or parts[1] != "200":
+            if len(parts) >= 2 and parts[1] == "407":
+                raise OSError(f"{self.label} needs a valid username and password ({status})")
+            raise OSError(f"{self.label} refused the tunnel: {status}")
+
+    def _socks5(self, sock, target: str, port: int):
+        methods = b"\x00\x02" if self.user else b"\x00"
+        sock.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        ver, method = _recv_exact(sock, 2)
+        if ver != 5:
+            raise OSError(f"{self.label} is not a SOCKS5 proxy")
+        if method == 0xFF:
+            raise OSError(f"{self.label}: no acceptable authentication method"
+                          + ("" if self.user else " (does it need a username?)"))
+        if method == 2:
+            u, p = self.user.encode()[:255], self.password.encode()[:255]
+            sock.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+            if _recv_exact(sock, 2)[1] != 0:
+                raise OSError(f"{self.label}: username or password rejected")
+        try:
+            addr = b"\x01" + socket.inet_aton(target)
+        except OSError:
+            name = target.encode("idna")
+            addr = b"\x03" + bytes([len(name)]) + name
+        sock.sendall(b"\x05\x01\x00" + addr + struct.pack(">H", port))
+        rep = _recv_exact(sock, 4)
+        if rep[1] != 0:
+            raise OSError(f"{self.label}: connect failed ({_SOCKS5_ERRORS.get(rep[1], rep[1])})")
+        atyp = rep[3]
+        n = 4 if atyp == 1 else 16 if atyp == 4 else _recv_exact(sock, 1)[0]
+        _recv_exact(sock, n + 2)
+
+
+def _parse_hostport(text: str, default_port: int) -> tuple[str, int] | None:
+    text = text.strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    text = text.split("@")[-1].strip("/")
+    if not text:
+        return None
+    if text.count(":") == 1:
+        host, port = text.split(":")
+    else:
+        host, port = text, ""
+    try:
+        return host, int(port) if port else default_port
+    except ValueError:
+        return None
+
+
+def system_proxy(target_host: str = "") -> tuple[Proxy | None, str]:
+    """Read the Windows (WinINET) proxy, falling back to HTTPS_PROXY.
+    Returns (proxy or None, human-readable description)."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+
+            def val(name, default=None):
+                try:
+                    return winreg.QueryValueEx(key, name)[0]
+                except OSError:
+                    return default
+            enabled, server = val("ProxyEnable", 0), val("ProxyServer", "") or ""
+            bypass, pac = val("ProxyOverride", "") or "", val("AutoConfigURL", "") or ""
+            winreg.CloseKey(key)
+            if enabled and server:
+                for pat in (p.strip() for p in bypass.split(";")):
+                    if pat and pat != "<local>" and target_host and fnmatch.fnmatch(target_host, pat):
+                        return None, f"Windows proxy is bypassed for {target_host}"
+                entries = {}
+                for part in server.split(";"):
+                    k, sep, v = part.partition("=")
+                    entries[k.strip().lower() if sep else "*"] = (v if sep else k).strip()
+                for scheme, kind in (("https", "http"), ("*", "http"), ("http", "http"),
+                                     ("socks", "socks5")):
+                    hp = _parse_hostport(entries.get(scheme, ""), 1080 if kind == "socks5" else 8080)
+                    if hp:
+                        p = Proxy(kind, hp[0], hp[1], source="system")
+                        return p, f"Windows proxy: {p.label}"
+            if pac:
+                return None, ("Windows uses a proxy setup script (PAC), which isn't supported. "
+                              "Enter the proxy manually.")
+        except OSError:
+            pass
+    env = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    if env:
+        hp = _parse_hostport(env, 8080)
+        if hp:
+            p = Proxy("socks5" if env.lower().startswith("socks") else "http", hp[0], hp[1],
+                      source="system")
+            return p, f"HTTPS_PROXY: {p.label}"
+    return None, "No system proxy is set (direct connection)"
+
+
+def make_proxy(cfg: dict, target_host: str = "") -> tuple[Proxy | None, str]:
+    """Proxy from the app config: (proxy or None for direct, description)."""
+    kind = cfg.get("proxy_type", "none")
+    remote = bool(cfg.get("proxy_remote_dns", True))
+    if kind == "system":
+        p, desc = system_proxy(target_host)
+        if p:
+            p.remote_dns = remote
+        return p, desc
+    if kind in ("http", "socks5") and str(cfg.get("proxy_host", "")).strip():
+        default = 1080 if kind == "socks5" else 8080
+        try:
+            port = int(cfg.get("proxy_port") or default)
+        except (TypeError, ValueError):
+            port = default
+        p = Proxy(kind, str(cfg["proxy_host"]).strip(), port, str(cfg.get("proxy_user", "")),
+                  str(cfg.get("proxy_password", "")), remote)
+        return p, p.label
+    return None, "Direct connection"
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection to a pre-resolved IP (or through a proxy); SNI and the
+    certificate check always use the real hostname."""
+
+    def __init__(self, host: str, ip: str | None, timeout: float, proxy: Proxy | None = None):
         super().__init__(host, 443, timeout=timeout, context=ssl.create_default_context())
         self._ip = ip
+        self._proxy = proxy
 
     def connect(self):
-        sock = socket.create_connection((self._ip, self.port), self.timeout)
+        if self._proxy:
+            sock = self._proxy.open(self.host, self.port, self._ip, self.timeout)
+        else:
+            sock = socket.create_connection((self._ip, self.port), self.timeout)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
@@ -290,18 +507,33 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 class BinanceClient:
     """Keep-alive REST client. `conn_info` describes the live connection."""
 
-    def __init__(self, host: str, resolver: Resolver, timeout: float = 8.0):
+    def __init__(self, host: str, resolver: Resolver, timeout: float = 8.0,
+                 proxy: Proxy | None = None):
         self.host = host
         self.resolver = resolver
+        self.proxy = proxy
         self.timeout = timeout
         self._conn: http.client.HTTPSConnection | None = None
         self.conn_info: dict | None = None
 
     def _connect(self):
+        proxy = self.proxy
+        via = proxy.label if proxy else None
+        if proxy and proxy.remote_dns:
+            # The proxy looks up the hostname: no local DNS needed.
+            conn = _PinnedHTTPSConnection(self.host, None, self.timeout, proxy)
+            try:
+                conn.connect()
+            except Exception:
+                conn.close()
+                raise
+            self._conn = conn
+            self.conn_info = {"host": self.host, "ip": None, "dns": "resolved by proxy", "proxy": via}
+            return
         ips, how = self.resolver.resolve(self.host)
         last_err = None
         for ip in ips[:4]:
-            conn = _PinnedHTTPSConnection(self.host, ip, self.timeout)
+            conn = _PinnedHTTPSConnection(self.host, ip, self.timeout, proxy)
             try:
                 conn.connect()
             except OSError as e:
@@ -309,7 +541,7 @@ class BinanceClient:
                 conn.close()
                 continue
             self._conn = conn
-            self.conn_info = {"host": self.host, "ip": ip, "dns": how}
+            self.conn_info = {"host": self.host, "ip": ip, "dns": how, "proxy": via}
             return
         self.resolver.invalidate(self.host)
         raise OSError(f"cannot connect to {self.host} ({', '.join(ips[:4])}): {last_err}")
@@ -319,11 +551,16 @@ class BinanceClient:
             if self._conn is None:
                 self._connect()
             try:
-                self._conn.request("GET", path, headers={
-                    "Accept": "application/json", "Connection": "keep-alive",
-                    "User-Agent": USER_AGENT})
+                headers = {"Accept": "application/json", "Accept-Encoding": "gzip",
+                           "Connection": "keep-alive", "User-Agent": USER_AGENT}
+                self._conn.request("GET", path, headers=headers)
                 resp = self._conn.getresponse()
                 body = resp.read()
+                _count_traffic(len(body) + sum(len(k) + len(v) + 4 for k, v in resp.getheaders()) + 17,
+                               len(path) + sum(len(k) + len(v) + 4 for k, v in headers.items())
+                               + len(self.host) + 24)
+                if resp.getheader("Content-Encoding", "").lower() == "gzip":
+                    body = gzip.decompress(body)  # JSON shrinks 5-15x on the wire
             except (http.client.HTTPException, OSError):
                 self.close()  # stale keep-alive connection: reconnect once
                 if attempt == 2:
@@ -378,24 +615,40 @@ class BinanceClient:
 # Background workers
 # --------------------------------------------------------------------------
 class _Worker(threading.Thread):
-    def __init__(self, out_q, host: str, resolver: Resolver):
+    def __init__(self, out_q, host: str, resolver: Resolver, proxy: Proxy | None = None):
         super().__init__(daemon=True)
         self.out_q = out_q
         self._lock = threading.Lock()
         self._host = host
         self._resolver = resolver
+        self._proxy = proxy
+        self._paused = False
         self._net_gen = 0
         self._client: BinanceClient | None = None
         self._client_gen = -1
         self._wake = threading.Event()
         self._stop_evt = threading.Event()
 
-    def set_network(self, host: str, resolver: Resolver):
+    def set_network(self, host: str, resolver: Resolver, proxy: Proxy | None = None):
         with self._lock:
             self._host = host
             self._resolver = resolver
+            self._proxy = proxy
             self._net_gen += 1
         self._wake.set()
+
+    def set_paused(self, paused: bool):
+        """Paused workers make no requests and drop their connection."""
+        self._paused = bool(paused)
+        self._wake.set()
+
+    def _idle_while_paused(self) -> bool:
+        if not self._paused:
+            return False
+        if self._client:
+            self._client.close()
+        self._sleep(3600)  # until resumed, reconfigured or stopped
+        return True
 
     def refresh_now(self):
         self._wake.set()
@@ -406,11 +659,11 @@ class _Worker(threading.Thread):
 
     def _get_client(self) -> BinanceClient:
         with self._lock:
-            gen, host, resolver = self._net_gen, self._host, self._resolver
+            gen, host, resolver, proxy = self._net_gen, self._host, self._resolver, self._proxy
         if self._client is None or self._client_gen != gen:
             if self._client:
                 self._client.close()
-            self._client = BinanceClient(host, resolver)
+            self._client = BinanceClient(host, resolver, proxy=proxy)
             self._client_gen = gen
         return self._client
 
@@ -422,8 +675,8 @@ class _Worker(threading.Thread):
 class PriceWorker(_Worker):
     """Polls 24h tickers for the favorites; fetches the symbol list once per host."""
 
-    def __init__(self, out_q, host: str, resolver: Resolver):
-        super().__init__(out_q, host, resolver)
+    def __init__(self, out_q, host: str, resolver: Resolver, proxy: Proxy | None = None):
+        super().__init__(out_q, host, resolver, proxy)
         self._symbols: list[str] = []
         self._interval = 1.0
         self._info_gen = -1
@@ -439,6 +692,9 @@ class PriceWorker(_Worker):
     def run(self):
         last_conn = None
         while not self._stop_evt.is_set():
+            if self._idle_while_paused():
+                last_conn = None
+                continue
             with self._lock:
                 symbols, interval = list(self._symbols), self._interval
             client = self._get_client()
@@ -459,13 +715,14 @@ class PriceWorker(_Worker):
                 # side thread so price updates aren't held up.
                 self._info_gen = self._client_gen
                 threading.Thread(target=self._load_exchange_info, daemon=True,
-                                 args=(self._client_gen, client.host, client.resolver)).start()
+                                 args=(self._client_gen, client.host, client.resolver,
+                                       client.proxy)).start()
             self._sleep(interval - (time.perf_counter() - started))
         if self._client:
             self._client.close()
 
-    def _load_exchange_info(self, gen: int, host: str, resolver: Resolver):
-        client = BinanceClient(host, resolver, timeout=20)
+    def _load_exchange_info(self, gen: int, host: str, resolver: Resolver, proxy: Proxy | None):
+        client = BinanceClient(host, resolver, timeout=20, proxy=proxy)
         try:
             info = client.exchange_info()
             if gen == self._client_gen:
@@ -482,10 +739,34 @@ class ChartWorker(_Worker):
     """Fetches candlesticks for the selected symbol; refreshes every few seconds."""
 
     REFRESH_S = 5.0
+    FULL = 500       # candles on first load
+    TAIL = 3         # candles per refresh afterwards (the live one + 2 overlap)
 
-    def __init__(self, out_q, host: str, resolver: Resolver):
-        super().__init__(out_q, host, resolver)
+    def __init__(self, out_q, host: str, resolver: Resolver, proxy: Proxy | None = None):
+        super().__init__(out_q, host, resolver, proxy)
         self._target: tuple[str, str] | None = None
+        self._cache_key: tuple[str, str] | None = None
+        self._candles: list[tuple] = []
+
+    def _fetch(self, client: BinanceClient, target: tuple[str, str]) -> list[tuple]:
+        """Full history once, then only the newest candles merged into the cache."""
+        if target == self._cache_key and self._candles:
+            tail = client.klines(*target, limit=self.TAIL)
+            candles = self._candles
+            if tail and tail[0][0] <= candles[-1][0]:  # overlaps the cache: merge
+                start = max(0, len(candles) - self.TAIL - 1)
+                index = {c[0]: i for i, c in enumerate(candles[start:], start)}
+                for c in tail:
+                    if c[0] in index:
+                        candles[index[c[0]]] = c
+                    elif c[0] > candles[-1][0]:
+                        candles.append(c)
+                self._candles = candles[-self.FULL:]
+                return list(self._candles)
+        # first load, new symbol/interval, or a gap (e.g. after a long pause)
+        self._candles = client.klines(*target, limit=self.FULL)
+        self._cache_key = target
+        return list(self._candles)
 
     def set_target(self, symbol: str | None, interval: str):
         with self._lock:
@@ -494,12 +775,14 @@ class ChartWorker(_Worker):
 
     def run(self):
         while not self._stop_evt.is_set():
+            if self._idle_while_paused():
+                continue
             with self._lock:
                 target = self._target
             if target:
                 client = self._get_client()
                 try:
-                    candles = client.klines(*target)
+                    candles = self._fetch(client, target)
                     self.out_q.put(("klines", target[0], target[1], candles))
                 except Exception as e:
                     self.out_q.put(("chart_error", target[0], target[1], str(e)))

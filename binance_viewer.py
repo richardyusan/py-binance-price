@@ -32,11 +32,12 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from chart import DEFAULT_INDICATORS, PriceChart
-from net import (DNS_MODES, DNS_PROVIDERS, MIN_REFRESH_MS, BinanceClient, ChartWorker,
-                 PriceWorker, Resolver)
+import tray
+from net import (DNS_MODES, DNS_PROVIDERS, MIN_REFRESH_MS, PROXY_TYPES, TRAFFIC, BinanceClient,
+                 ChartWorker, PriceWorker, Resolver, make_proxy, system_proxy)
 
 APP_NAME = "Binance Price Viewer"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_AUTHOR = "richardyusan"
 APP_URL = "https://github.com/richardyusan/py-binance-price"
 
@@ -67,6 +68,18 @@ DEFAULT_CONFIG: dict = {
     # If the chosen DNS is blocked (e.g. office firewall drops 1.1.1.1), try
     # the other encrypted public resolvers and keep the first that answers.
     "dns_fallback": True,
+    # Proxy: none | system (Windows settings) | http (CONNECT) | socks5
+    "proxy_type": "none",
+    "proxy_host": "",
+    "proxy_port": 8080,
+    "proxy_user": "",
+    "proxy_password": "",
+    "proxy_remote_dns": True,     # let the proxy resolve hostnames
+    # System tray / window behaviour
+    "close_to_tray": True,        # X hides to the tray; exit via tray menu or File > Exit
+    "minimize_to_tray": False,
+    "start_in_tray": False,
+    "pause_when_hidden": True,    # no network traffic while hidden or minimized
     "always_on_top": False,
     "flash": True,
     "sort_column": None,
@@ -115,6 +128,14 @@ def fmt_price(value: str, tick: Decimal | None) -> str:
     return s or "0"
 
 
+def fmt_bytes(n: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.2f} GB"
+
+
 def fmt_volume(value: str) -> str:
     v = float(value)
     for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
@@ -152,12 +173,18 @@ class App(tk.Tk):
         self.conn_info: dict | None = None
         self.last_error: str | None = None
         self.resolver = make_resolver(DEFAULT_CONFIG)
+        self.proxy = None
+        self.tray: tray.TrayIcon | None = None
+        self._eff_paused = False
+        self._tray_hint_shown = False
+        self._tip_lines: list[str] = []
 
         self.q: queue.Queue = queue.Queue()
         self.worker = PriceWorker(self.q, DEFAULT_CONFIG["api_host"], self.resolver)
         self.chart_worker = ChartWorker(self.q, DEFAULT_CONFIG["api_host"], self.resolver)
 
         self._build_style()
+        self._init_tray()
         self._build_menu()
         self._build_toolbar()
         self._build_statusbar()   # packed at the bottom before the expanding panes
@@ -167,7 +194,119 @@ class App(tk.Tk):
         self.worker.start()
         self.chart_worker.start()
         self._drain_job = self.after(30, self._drain_queue)
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.protocol("WM_DELETE_WINDOW", self.on_window_close)
+        self.bind("<Unmap>", self._on_unmap)
+        self.bind("<Map>", lambda e: e.widget is self and self._update_pause())
+        if self.config_data.get("start_in_tray") and self.tray:
+            self.after(10, self.hide_window)
+
+    # ---------------- Tray / window / pause ----------------
+    def _init_tray(self):
+        icon = RES_DIR / "icon.ico"
+        t = tray.TrayIcon(str(icon), APP_NAME, lambda action: self.q.put(("tray", action)))
+        if t.start():
+            self.tray = t
+
+    def _hidden(self) -> bool:
+        return self.state() in ("withdrawn", "iconic")
+
+    def on_window_close(self):
+        """Window X button: hide to the tray (default) or exit."""
+        if self.config_data.get("close_to_tray", True):
+            self.hide_window()
+        else:
+            self.exit_app()
+
+    def hide_window(self):
+        if self.tray:
+            self.withdraw()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.notify(APP_NAME, "Still running in the system tray. Click the icon to open "
+                                           "it, right-click for Exit.")
+        else:
+            self.iconify()
+        self._update_pause()
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        if not self.var_top.get():  # bring to front even if another app has focus
+            self.attributes("-topmost", True)
+            self.after(200, lambda: self.attributes("-topmost", self.var_top.get()))
+        self._update_pause()
+
+    def _on_unmap(self, event):
+        if event.widget is not self:
+            return
+        if self.tray and self.config_data.get("minimize_to_tray") and self.state() == "iconic":
+            self.after(0, self.withdraw)
+        self.after(50, self._update_pause)
+
+    def _on_tray(self, action: str):
+        if action == "toggle":
+            self.show_window() if self._hidden() else self.hide_window()
+        elif action == "pause":
+            self.var_paused.set(not self.var_paused.get())
+            self._update_pause()
+        elif action == "exit":
+            self.after_idle(self.exit_app)  # not from inside _drain_queue
+
+    def toggle_pause(self):
+        self.var_paused.set(not self.var_paused.get())
+        self._update_pause()
+
+    def _update_pause(self):
+        """Pause the workers when paused manually, or when hidden (if enabled)."""
+        if not self.winfo_exists():
+            return
+        manual = self.var_paused.get()
+        auto = bool(self.config_data.get("pause_when_hidden", True)) and self._hidden()
+        paused = manual or auto
+        self.var_pause_text.set("▶ Resume" if manual else "⏸ Pause")
+        if paused != self._eff_paused:
+            self._eff_paused = paused
+            self.worker.set_paused(paused)
+            self.chart_worker.set_paused(paused)
+            if paused:
+                self.conn_info = None
+                self.var_status.set("Updates paused: no network requests"
+                                    + ("" if manual else " while the window is hidden"))
+            else:
+                self.var_status.set("Resuming...")
+        if self.tray:
+            self.tray.paused = manual
+            self.tray.window_visible = not self._hidden()
+        self._update_conn_bar()
+        self._update_tray_tip()
+
+    def _update_tray_tip(self):
+        if not self.tray:
+            return
+        lines = [APP_NAME]
+        if self._eff_paused:
+            lines.append("Updates paused")
+        lines += self._tip_lines
+        text = ""
+        for line in lines:  # tooltip limit is 127 characters
+            if len(text) + len(line) + 1 > 127:
+                break
+            text += ("\n" if text else "") + line
+        self.tray.set_tooltip(text)
+
+    def exit_app(self):
+        if self.dirty and self._hidden():
+            self.show_window()
+        if not self._confirm_discard():
+            return
+        self.worker.stop()
+        self.chart_worker.stop()
+        if self.tray:
+            self.tray.stop()
+        if self._drain_job:
+            self.after_cancel(self._drain_job)
+        self.destroy()
 
     # ---------------- UI construction ----------------
     def _set_icon(self):
@@ -235,6 +374,12 @@ class App(tk.Tk):
         style.configure("TLabelframe", background=BG, bordercolor="#2b3139")
         style.configure("TLabelframe.Label", background=BG, foreground=FG_DIM)
         style.configure("TEntry", fieldbackground=BG_ALT, foreground=FG, insertcolor=FG)
+        style.map("TEntry", fieldbackground=[("disabled", BG)], foreground=[("disabled", FG_DIM)])
+        style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background=BG_ALT, foreground=FG_DIM, padding=(10, 5),
+                        borderwidth=0)
+        style.map("TNotebook.Tab", background=[("selected", "#2b3139"), ("active", "#22262c")],
+                  foreground=[("selected", ACCENT), ("active", FG)])
         # Dropdown list of the combobox
         self.option_add("*TCombobox*Listbox.background", BG_ALT)
         self.option_add("*TCombobox*Listbox.foreground", FG)
@@ -251,7 +396,8 @@ class App(tk.Tk):
         filem.add_command(label="Reset to defaults", command=self.reset_defaults)
         filem.add_command(label="Open app folder", command=lambda: webbrowser.open(APP_DIR.as_uri()))
         filem.add_separator()
-        filem.add_command(label="Exit", command=self.on_close)
+        filem.add_command(label="Hide to tray" if self.tray else "Minimize", command=self.hide_window)
+        filem.add_command(label="Exit", accelerator="Ctrl+Q", command=self.exit_app)
         menubar.add_cascade(label="File", menu=filem)
 
         viewm = tk.Menu(menubar, tearoff=False)
@@ -261,14 +407,20 @@ class App(tk.Tk):
         viewm.add_checkbutton(label="Flash on price change", variable=self.var_flash,
                               command=lambda: self._set_cfg("flash", self.var_flash.get()))
         viewm.add_separator()
+        self.var_paused = tk.BooleanVar(value=False)
+        self.var_pause_text = tk.StringVar(value="⏸ Pause")
+        viewm.add_checkbutton(label="Pause updates", accelerator="Ctrl+P", variable=self.var_paused,
+                              command=self._update_pause)
         self.var_show_chart = tk.BooleanVar(value=False)
         viewm.add_checkbutton(label="Show chart", accelerator="Ctrl+G", variable=self.var_show_chart,
                               command=lambda: self.set_chart_visible(self.var_show_chart.get()))
         menubar.add_cascade(label="View", menu=viewm)
 
         setm = tk.Menu(menubar, tearoff=False)
-        setm.add_command(label="Connection & DNS...", accelerator="Ctrl+,",
-                         command=self.open_connection_settings)
+        setm.add_command(label="Connection & proxy...", accelerator="Ctrl+,",
+                         command=lambda: self.open_connection_settings(0))
+        setm.add_command(label="DNS...", command=lambda: self.open_connection_settings(1))
+        setm.add_command(label="Window & tray...", command=lambda: self.open_connection_settings(2))
         menubar.add_cascade(label="Settings", menu=setm)
 
         helpm = tk.Menu(menubar, tearoff=False)
@@ -283,6 +435,8 @@ class App(tk.Tk):
         self.bind_all("<Control-s>", lambda e: self.save_config())
         self.bind_all("<Control-S>", lambda e: self.save_config_as())
         self.bind_all("<Control-comma>", lambda e: self.open_connection_settings())
+        self.bind_all("<Control-p>", lambda e: self.toggle_pause())
+        self.bind_all("<Control-q>", lambda e: self.exit_app())
         self.bind_all("<Control-g>", lambda e: self.set_chart_visible(not self.var_show_chart.get()))
         self.bind_all("<F5>", lambda e: (self.worker.refresh_now(), self.chart_worker.refresh_now()))
 
@@ -305,7 +459,9 @@ class App(tk.Tk):
         ttk.Button(bar, text="▼", width=3, command=lambda: self.move_selected(1)).pack(side="left", padx=(2, 0))
 
         ttk.Checkbutton(bar, text="\U0001F4C8 Chart", style="Toggle.TCheckbutton", variable=self.var_show_chart,
-                        command=lambda: self.set_chart_visible(self.var_show_chart.get())).pack(side="right", padx=(14, 0))
+                        command=lambda: self.set_chart_visible(self.var_show_chart.get())).pack(side="right", padx=(6, 0))
+        ttk.Checkbutton(bar, textvariable=self.var_pause_text, style="Toggle.TCheckbutton", width=10,
+                        variable=self.var_paused, command=self._update_pause).pack(side="right", padx=(14, 0))
         ttk.Label(bar, text="ms").pack(side="right")
         self.var_refresh = tk.StringVar(value="1000")
         spin = ttk.Spinbox(bar, from_=MIN_REFRESH_MS, to=60000, increment=250, width=7,
@@ -431,7 +587,10 @@ class App(tk.Tk):
 
     def _update_conn_bar(self):
         host = self.config_data.get("api_host")
-        if self.last_error:
+        if self._eff_paused:
+            self.conn_dot.config(fg=FG_DIM)
+            self.var_conn_state.set("Paused" if self.var_paused.get() else "Paused (hidden)")
+        elif self.last_error:
             self.conn_dot.config(fg=DOWN)
             self.var_conn_state.set("Disconnected")
         elif self.conn_info:
@@ -440,13 +599,18 @@ class App(tk.Tk):
         else:
             self.conn_dot.config(fg=ACCENT)
             self.var_conn_state.set("Connecting...")
-        if self.conn_info:
-            self.var_conn_api.set(f"https://{self.conn_info['host']}  ({self.conn_info['ip']})")
+        info = self.conn_info
+        if info:
+            route = [info["ip"]] if info["ip"] else []
+            if info.get("proxy"):
+                route.append(f"via {info['proxy']}")
+            self.var_conn_api.set(f"https://{info['host']}  ({', '.join(route)})")
             # The server that actually answered (may be a fallback, e.g. DoT).
-            self.var_conn_dns.set(self.conn_info["dns"])
+            self.var_conn_dns.set(info["dns"])
         else:
-            self.var_conn_api.set(f"https://{host}")
-            self.var_conn_dns.set(self.resolver.label)
+            proxy = self.proxy
+            self.var_conn_api.set(f"https://{host}" + (f"  (via {proxy.label})" if proxy else ""))
+            self.var_conn_dns.set("resolved by proxy" if proxy and proxy.remote_dns else self.resolver.label)
 
     # ---------------- Config ----------------
     def _load_initial_config(self):
@@ -736,25 +900,34 @@ class App(tk.Tk):
         """(Re)create the resolver from config and hand it to both workers."""
         host = self.config_data.get("api_host") or DEFAULT_CONFIG["api_host"]
         self.resolver = make_resolver(self.config_data)
+        self.proxy = make_proxy(self.config_data, host)[0]
         self.conn_info = None
         self.last_error = None
         self.exchange.clear()
-        self.worker.set_network(host, self.resolver)
-        self.chart_worker.set_network(host, self.resolver)
+        self.worker.set_network(host, self.resolver, self.proxy)
+        self.chart_worker.set_network(host, self.resolver, self.proxy)
         self._update_conn_bar()
 
-    def open_connection_settings(self):
+    def open_connection_settings(self, tab: int = 0):
         if getattr(self, "_settings_win", None) and self._settings_win.winfo_exists():
+            self._settings_nb.select(tab)
+            self._settings_win.deiconify()
             self._settings_win.lift()
             return
+        if self.state() != "normal":
+            self.show_window()
         win = tk.Toplevel(self)
         self._settings_win = win
-        win.title("Connection & DNS settings")
+        win.title("Settings")
         win.configure(bg=BG)
         win.transient(self)
         win.resizable(False, False)
         body = ttk.Frame(win, padding=14)
         body.pack(fill="both")
+        nb = ttk.Notebook(body)
+        nb.pack(fill="both")
+        self._settings_nb = nb
+        small = ("Segoe UI", 8)
 
         cfg = self.config_data
         prov_keys = list(DNS_PROVIDERS)
@@ -762,18 +935,60 @@ class App(tk.Tk):
                        for k in prov_keys]
         mode_keys = list(DNS_MODES)
         mode_labels = [DNS_MODES[k] for k in mode_keys]
+        ptype_keys = list(PROXY_TYPES)
+        ptype_labels = [PROXY_TYPES[k] for k in ptype_keys]
 
-        # API host
-        api = ttk.Labelframe(body, text=" Binance API ", padding=10)
+        # ---- Tab 1: Connection (API host + proxy) ----
+        tab_conn = ttk.Frame(nb, padding=10)
+        nb.add(tab_conn, text="  Connection  ")
+        api = ttk.Labelframe(tab_conn, text=" Binance API ", padding=10)
         api.pack(fill="x")
         ttk.Label(api, text="REST host").grid(row=0, column=0, sticky="w")
         var_host = tk.StringVar(value=cfg.get("api_host", DEFAULT_CONFIG["api_host"]))
         ttk.Combobox(api, textvariable=var_host, values=API_HOSTS, width=44).grid(
             row=0, column=1, padx=(10, 0), sticky="we")
 
-        # DNS
-        dns = ttk.Labelframe(body, text=" DNS resolver ", padding=10)
-        dns.pack(fill="x", pady=(10, 0))
+        prx = ttk.Labelframe(tab_conn, text=" Proxy ", padding=10)
+        prx.pack(fill="x", pady=(10, 0))
+        ttk.Label(prx, text="Type").grid(row=0, column=0, sticky="w")
+        cur_pt = cfg.get("proxy_type", "none")
+        var_ptype = tk.StringVar(value=PROXY_TYPES.get(cur_pt, PROXY_TYPES["none"]))
+        cb_ptype = ttk.Combobox(prx, textvariable=var_ptype, values=ptype_labels, state="readonly", width=44)
+        cb_ptype.grid(row=0, column=1, columnspan=3, padx=(10, 0), sticky="we")
+
+        ttk.Label(prx, text="Host").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        var_phost = tk.StringVar(value=cfg.get("proxy_host", ""))
+        ent_phost = ttk.Entry(prx, textvariable=var_phost, width=30)
+        ent_phost.grid(row=1, column=1, padx=(10, 0), pady=(8, 0), sticky="we")
+        ttk.Label(prx, text="Port").grid(row=1, column=2, sticky="e", padx=(10, 0), pady=(8, 0))
+        var_pport = tk.StringVar(value=str(cfg.get("proxy_port", 8080)))
+        ent_pport = ttk.Entry(prx, textvariable=var_pport, width=7)
+        ent_pport.grid(row=1, column=3, padx=(6, 0), pady=(8, 0), sticky="e")
+
+        ttk.Label(prx, text="Username").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        var_puser = tk.StringVar(value=cfg.get("proxy_user", ""))
+        ent_puser = ttk.Entry(prx, textvariable=var_puser, width=30)
+        ent_puser.grid(row=2, column=1, padx=(10, 0), pady=(8, 0), sticky="we")
+        ttk.Label(prx, text="Password").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        var_ppass = tk.StringVar(value=cfg.get("proxy_password", ""))
+        ent_ppass = ttk.Entry(prx, textvariable=var_ppass, width=30, show="•")
+        ent_ppass.grid(row=3, column=1, padx=(10, 0), pady=(8, 0), sticky="we")
+        ttk.Label(prx, text="optional", style="Dim.TLabel", font=small).grid(
+            row=2, column=2, columnspan=2, sticky="w", padx=(10, 0), pady=(8, 0))
+
+        var_premote = tk.BooleanVar(value=bool(cfg.get("proxy_remote_dns", True)))
+        chk_premote = ttk.Checkbutton(prx, variable=var_premote,
+                                      text="Let the proxy look up hostnames (skips local DNS; recommended)")
+        chk_premote.grid(row=4, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        var_pinfo = tk.StringVar()
+        ttk.Label(prx, textvariable=var_pinfo, style="Dim.TLabel", font=small, justify="left",
+                  wraplength=460).grid(row=5, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+        # ---- Tab 2: DNS ----
+        tab_dns = ttk.Frame(nb, padding=10)
+        nb.add(tab_dns, text="  DNS  ")
+        dns = ttk.Labelframe(tab_dns, text=" DNS resolver ", padding=10)
+        dns.pack(fill="x")
         ttk.Label(dns, text="Provider").grid(row=0, column=0, sticky="w")
         cur_prov = cfg.get("dns_provider", "cloudflare")
         var_prov = tk.StringVar(value=prov_labels[prov_keys.index(cur_prov)] if cur_prov in prov_keys
@@ -791,7 +1006,7 @@ class App(tk.Tk):
         ent_custom = ttk.Entry(dns, textvariable=var_custom, width=46)
         ent_custom.grid(row=2, column=1, padx=(10, 0), pady=(8, 0), sticky="we")
         ttk.Label(dns, text="IP addresses, comma separated (used when Provider = Custom)",
-                  style="Dim.TLabel", font=("Segoe UI", 8)).grid(row=3, column=1, sticky="w", padx=(10, 0))
+                  style="Dim.TLabel", font=small).grid(row=3, column=1, sticky="w", padx=(10, 0))
         var_fallback = tk.BooleanVar(value=bool(cfg.get("dns_fallback", True)))
         chk_fallback = ttk.Checkbutton(
             dns, variable=var_fallback,
@@ -799,31 +1014,106 @@ class App(tk.Tk):
         chk_fallback.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(dns, text="Tip: many ISPs hijack plain DNS (UDP 53). DNS over HTTPS / TLS is encrypted\n"
                             "so Binance hostnames resolve to their real servers. Office networks often\n"
-                            "block Cloudflare and Google DNS; the fallback finds one that is allowed.",
-                  style="Dim.TLabel", font=("Segoe UI", 8), justify="left").grid(
+                            "block Cloudflare and Google DNS; the fallback finds one that is allowed.\n"
+                            "Not used when a proxy looks up hostnames.",
+                  style="Dim.TLabel", font=small, justify="left").grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        # ---- Tab 3: Window & tray ----
+        tab_tray = ttk.Frame(nb, padding=10)
+        nb.add(tab_tray, text="  Window & tray  ")
+        trayf = ttk.Labelframe(tab_tray, text=" System tray ", padding=10)
+        trayf.pack(fill="x")
+        tray_opts = [
+            ("close_to_tray", "Close button (X) hides the window to the tray instead of exiting"),
+            ("minimize_to_tray", "Minimize button hides the window to the tray"),
+            ("start_in_tray", "Start hidden in the tray"),
+        ]
+        tray_vars = {}
+        for i, (key, text) in enumerate(tray_opts):
+            tray_vars[key] = tk.BooleanVar(value=bool(cfg.get(key, DEFAULT_CONFIG[key])))
+            cb = ttk.Checkbutton(trayf, text=text, variable=tray_vars[key])
+            cb.grid(row=i, column=0, sticky="w", pady=(0 if i == 0 else 6, 0))
+            if not self.tray:
+                cb.state(["disabled"])
+        ttk.Label(trayf, style="Dim.TLabel", font=small, justify="left", text=(
+            "Left-click the tray icon to show or hide the window. Right-click it for\n"
+            "Pause updates and Exit. File → Exit (Ctrl+Q) also quits."
+            if self.tray else "The system tray isn't available here; the window minimizes instead.")).grid(
+            row=len(tray_opts), column=0, sticky="w", pady=(10, 0))
+
+        powf = ttk.Labelframe(tab_tray, text=" Data and battery ", padding=10)
+        powf.pack(fill="x", pady=(10, 0))
+        tray_vars["pause_when_hidden"] = tk.BooleanVar(value=bool(cfg.get("pause_when_hidden", True)))
+        ttk.Checkbutton(powf, variable=tray_vars["pause_when_hidden"],
+                        text="Pause updates while the window is hidden or minimized").grid(
+            row=0, column=0, sticky="w")
+        ttk.Label(powf, style="Dim.TLabel", font=small, justify="left", text=(
+            "Paused means no network requests at all: the connection is closed and\n"
+            "prices refresh as soon as the window is shown again. Use the ⏸ Pause button\n"
+            "(Ctrl+P) to pause manually at any time.")).grid(row=1, column=0, sticky="w", pady=(8, 0))
 
         def sync_state(*_):
             key = prov_keys[prov_labels.index(var_prov.get())]
             ent_custom.state(["!disabled"] if key == "custom" else ["disabled"])
             cb_mode.state(["disabled"] if key == "system" else ["!disabled", "readonly"])
             chk_fallback.state(["disabled"] if key == "system" else ["!disabled"])
+            pt = ptype_keys[ptype_labels.index(var_ptype.get())]
+            manual = ["!disabled"] if pt in ("http", "socks5") else ["disabled"]
+            for w in (ent_phost, ent_pport, ent_puser, ent_ppass):
+                w.state(manual)
+            chk_premote.state(["disabled"] if pt == "none" else ["!disabled"])
+            if pt == "system":
+                var_pinfo.set(system_proxy(var_host.get().strip())[1])
+            elif pt in ("http", "socks5"):
+                var_pinfo.set("Ask your IT department for the proxy address. The username and password "
+                              "are saved in plain text in config.json.")
+            else:
+                var_pinfo.set("Connects directly to Binance.")
+
+        def on_ptype(_e=None):
+            pt = ptype_keys[ptype_labels.index(var_ptype.get())]
+            if pt in ("http", "socks5") and var_pport.get().strip() in ("", "8080", "1080"):
+                var_pport.set("1080" if pt == "socks5" else "8080")
+            sync_state()
         cb_prov.bind("<<ComboboxSelected>>", sync_state)
+        cb_ptype.bind("<<ComboboxSelected>>", on_ptype)
         sync_state()
 
-        def collect() -> dict:
+        def collect() -> dict | None:
             host = var_host.get().strip().replace("https://", "").replace("http://", "").strip("/")
-            return {
+            pt = ptype_keys[ptype_labels.index(var_ptype.get())]
+            try:
+                port = int(var_pport.get().strip() or 0)
+                if pt in ("http", "socks5") and not 0 < port < 65536:
+                    raise ValueError
+            except ValueError:
+                nb.select(0)
+                messagebox.showerror(APP_NAME, "Proxy port must be a number from 1 to 65535.", parent=win)
+                return None
+            if pt in ("http", "socks5") and not var_phost.get().strip():
+                nb.select(0)
+                messagebox.showerror(APP_NAME, "Enter the proxy host.", parent=win)
+                return None
+            new = {
                 "api_host": host or DEFAULT_CONFIG["api_host"],
+                "proxy_type": pt,
+                "proxy_host": var_phost.get().strip(),
+                "proxy_port": port or DEFAULT_CONFIG["proxy_port"],
+                "proxy_user": var_puser.get().strip(),
+                "proxy_password": var_ppass.get(),
+                "proxy_remote_dns": bool(var_premote.get()),
                 "dns_provider": prov_keys[prov_labels.index(var_prov.get())],
                 "dns_mode": mode_keys[mode_labels.index(var_mode.get())],
                 "dns_custom": var_custom.get().strip(),
                 "dns_fallback": bool(var_fallback.get()),
             }
+            new.update({k: bool(v.get()) for k, v in tray_vars.items()})
+            return new
 
         var_result = tk.StringVar(value="")
         lbl_result = tk.Label(body, textvariable=var_result, bg=BG, fg=FG_DIM, justify="left",
-                              anchor="w", font=("Consolas", 9), wraplength=500)
+                              anchor="w", font=("Consolas", 9), wraplength=520)
         lbl_result.pack(fill="x", pady=(10, 0))
 
         def show_result(text, color):
@@ -833,19 +1123,22 @@ class App(tk.Tk):
 
         def test():
             new = collect()
+            if new is None:
+                return
             show_result("Testing...", FG_DIM)
 
             def run():
                 t0 = time.perf_counter()
-                client = BinanceClient(new["api_host"], make_resolver(new), timeout=6)
+                proxy = make_proxy(new, new["api_host"])[0]
+                client = BinanceClient(new["api_host"], make_resolver(new), timeout=8, proxy=proxy)
                 try:
-                    ips, how = client.resolver.resolve(new["api_host"])
-                    t_dns = (time.perf_counter() - t0) * 1000
                     client.tickers(["BTCUSDT"])
                     t_all = (time.perf_counter() - t0) * 1000
-                    text = (f"OK   {new['api_host']} -> {client.conn_info['ip']}\n"
-                            f"DNS  {how}: {', '.join(ips[:3])}  ({t_dns:.0f} ms)\n"
-                            f"Total {t_all:.0f} ms (DNS + TLS + first request)")
+                    info = client.conn_info
+                    text = (f"OK    {new['api_host']} -> {info['ip'] or 'via proxy'}\n"
+                            f"Route {info.get('proxy') or 'direct'}\n"
+                            f"DNS   {info['dns']}\n"
+                            f"Total {t_all:.0f} ms (DNS + proxy + TLS + first request)")
                     color = UP
                 except Exception as e:
                     text, color = f"FAILED: {e}", DOWN
@@ -854,15 +1147,24 @@ class App(tk.Tk):
                 self.after(0, show_result, text, color)
             threading.Thread(target=run, daemon=True).start()
 
+        net_keys = ("api_host", "proxy_type", "proxy_host", "proxy_port", "proxy_user", "proxy_password",
+                    "proxy_remote_dns", "dns_provider", "dns_mode", "dns_custom", "dns_fallback")
+
         def apply(close: bool):
             new = collect()
+            if new is None:
+                return
             if new["dns_provider"] == "custom" and not new["dns_custom"]:
+                nb.select(1)
                 messagebox.showerror(APP_NAME, "Enter at least one custom DNS server IP.", parent=win)
                 return
-            if any(self.config_data.get(k) != v for k, v in new.items()):
+            changed = {k for k, v in new.items() if self.config_data.get(k) != v}
+            if changed:
                 self.config_data.update(new)
                 self._mark_dirty()
-                self._apply_network()
+                if changed & set(net_keys):
+                    self._apply_network()
+                self._update_pause()
             if close:
                 win.destroy()
 
@@ -873,9 +1175,10 @@ class App(tk.Tk):
         ttk.Button(btns, text="Apply", command=lambda: apply(False)).pack(side="right", padx=6)
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
         win.bind("<Escape>", lambda e: win.destroy())
+        nb.select(tab)
         win.update_idletasks()
         x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
-        win.geometry(f"+{max(0, x)}+{self.winfo_rooty() + 60}")
+        win.geometry(f"+{max(0, x)}+{max(0, self.winfo_rooty() + 40)}")
         win.grab_set()
 
     # ---------------- Chart ----------------
@@ -947,6 +1250,11 @@ class App(tk.Tk):
             while True:
                 msg = self.q.get_nowait()
                 kind = msg[0]
+                if kind == "tray":
+                    self._on_tray(msg[1])
+                    continue
+                if self._eff_paused and kind in ("tickers", "conn", "error"):
+                    continue  # a request that was already in flight when pausing
                 if kind == "tickers":
                     latest_tickers = msg  # only render the newest batch
                     if self.last_error:
@@ -1026,8 +1334,16 @@ class App(tk.Tk):
         if col and col != "symbol":
             self.sort_by(col)
         n = len(self.tree.get_children())
+        tips = []
+        for s in self.tree.get_children()[:4]:
+            v = self.tree.item(s, "values")
+            if v and v[1] not in ("", "..."):
+                tips.append(f"{s} {v[1]} {v[3]}")
+        self._tip_lines = tips
+        self._update_tray_tip()
         self.var_status.set(f"{n} symbols   ·   latency {latency:.0f} ms   ·   "
-                            f"updated {time.strftime('%H:%M:%S')}   ·   every {self.config_data['refresh_ms']} ms")
+                            f"updated {time.strftime('%H:%M:%S')}   ·   every {self.config_data['refresh_ms']} ms"
+                            f"   ·   data {fmt_bytes(TRAFFIC['down'] + TRAFFIC['up'])}")
 
     def _unflash(self, s: str, _trend: str):
         self.flash_jobs.pop(s, None)
@@ -1060,14 +1376,8 @@ class App(tk.Tk):
             self.clipboard_clear()
             self.clipboard_append(self.tree.set(sel[0], "price").replace(",", ""))
 
-    def on_close(self):
-        if not self._confirm_discard():
-            return
-        self.worker.stop()
-        self.chart_worker.stop()
-        if self._drain_job:
-            self.after_cancel(self._drain_job)
-        self.destroy()
+    def on_close(self):  # kept for compatibility
+        self.exit_app()
 
 
 def main():
