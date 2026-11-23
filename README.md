@@ -14,7 +14,7 @@ Pure Python standard library (Tkinter + `http.client`): no `pip install`, starts
   - Candles or line, intervals 1m / 5m / 15m / 1h / 4h / 1d / 1w
   - Indicators: **Bollinger Bands (20, 2)**, MA (7/25/99), EMA (12/26), Volume, RSI (14), MACD (12, 26, 9)
   - Crosshair with OHLC and indicator values, mouse-wheel zoom, live-updating last candle
-- **Custom DNS resolver**: Cloudflare 1.1.1.1 (default), Google, Quad9, AdGuard, OpenDNS, system DNS or your own servers. Uses DNS over HTTPS, DNS over TLS or plain UDP.
+- **Custom DNS resolver**: Cloudflare 1.1.1.1 (default), Google, Quad9, AdGuard, OpenDNS, system DNS or your own servers. Uses DNS over HTTPS, DNS over TLS or plain UDP. If the chosen resolver is blocked (common on office networks), it **automatically falls back** to another encrypted resolver.
 - **Connection info bar**: connection state, API host and server IP, and the DNS server that answered.
 - **Save / load configuration** as JSON in the app folder (`config.json` loads automatically on startup).
 - Dark theme, high-DPI aware, custom app icon.
@@ -92,6 +92,8 @@ Many ISPs block Binance by **hijacking DNS**: every lookup on port 53 is interce
 
 Quad9 only accepts HTTP/2 for DoH, so the app uses DoT for it automatically.
 
+**Automatic fallback** (on by default): office and campus firewalls often block the well-known resolvers such as 1.1.1.1 and 8.8.8.8 outright. If the chosen provider hasn't answered within 1.5 s, the app also queries Cloudflare, Quad9, AdGuard, OpenDNS and Google over DoH / DoT in parallel. It uses the first real answer and keeps using that provider. The status bar then shows, for example, `Quad9 9.9.9.9 (DoT) (fallback)`. Plain UDP is never used for fallback. Turn it off with the **If blocked, automatically try other encrypted DNS** checkbox.
+
 API hosts:
 - `data-api.binance.vision` (default): Binance's public market-data endpoint
 - `api.binance.com` / `api1-4.binance.com`: main API
@@ -111,6 +113,7 @@ Use **Test connection** to check a setup before applying it.
   "dns_provider": "cloudflare",
   "dns_mode": "doh",
   "dns_custom": "",
+  "dns_fallback": true,
   "always_on_top": false,
   "flash": true,
   "sort_column": null,
@@ -128,6 +131,7 @@ Use **Test connection** to check a setup before applying it.
 | `dns_provider` | `cloudflare`, `google`, `quad9`, `adguard`, `opendns`, `system`, `custom` |
 | `dns_mode` | `doh`, `dot`, `udp` |
 | `dns_custom` | Comma-separated resolver IPs, used when `dns_provider` is `custom` |
+| `dns_fallback` | `true` (default) to try other encrypted resolvers when the chosen one is blocked |
 
 Use **File → Save config as…** to keep several configs, for example `majors.json` and `alts.json`.
 

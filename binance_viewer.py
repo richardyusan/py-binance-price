@@ -36,7 +36,7 @@ from net import (DNS_MODES, DNS_PROVIDERS, MIN_REFRESH_MS, BinanceClient, ChartW
                  PriceWorker, Resolver)
 
 APP_NAME = "Binance Price Viewer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHOR = "richardyusan"
 APP_URL = "https://github.com/richardyusan/py-binance-price"
 
@@ -64,6 +64,9 @@ DEFAULT_CONFIG: dict = {
     "dns_provider": "cloudflare",
     "dns_mode": "doh",            # doh | dot | udp
     "dns_custom": "",             # e.g. "1.1.1.1, 8.8.8.8" when provider == custom
+    # If the chosen DNS is blocked (e.g. office firewall drops 1.1.1.1), try
+    # the other encrypted public resolvers and keep the first that answers.
+    "dns_fallback": True,
     "always_on_top": False,
     "flash": True,
     "sort_column": None,
@@ -122,7 +125,8 @@ def fmt_volume(value: str) -> str:
 
 def make_resolver(cfg: dict) -> Resolver:
     custom = [s for s in str(cfg.get("dns_custom") or "").replace(";", ",").split(",") if s.strip()]
-    return Resolver(cfg.get("dns_provider", "cloudflare"), cfg.get("dns_mode", "doh"), custom)
+    return Resolver(cfg.get("dns_provider", "cloudflare"), cfg.get("dns_mode", "doh"), custom,
+                    fallback=bool(cfg.get("dns_fallback", True)))
 
 
 # --------------------------------------------------------------------------
@@ -788,15 +792,22 @@ class App(tk.Tk):
         ent_custom.grid(row=2, column=1, padx=(10, 0), pady=(8, 0), sticky="we")
         ttk.Label(dns, text="IP addresses, comma separated (used when Provider = Custom)",
                   style="Dim.TLabel", font=("Segoe UI", 8)).grid(row=3, column=1, sticky="w", padx=(10, 0))
+        var_fallback = tk.BooleanVar(value=bool(cfg.get("dns_fallback", True)))
+        chk_fallback = ttk.Checkbutton(
+            dns, variable=var_fallback,
+            text="If blocked, automatically try other encrypted DNS (Quad9, AdGuard, OpenDNS...)")
+        chk_fallback.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(dns, text="Tip: many ISPs hijack plain DNS (UDP 53). DNS over HTTPS / TLS is encrypted\n"
-                            "so Binance hostnames resolve to their real servers.",
+                            "so Binance hostnames resolve to their real servers. Office networks often\n"
+                            "block Cloudflare and Google DNS; the fallback finds one that is allowed.",
                   style="Dim.TLabel", font=("Segoe UI", 8), justify="left").grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         def sync_state(*_):
             key = prov_keys[prov_labels.index(var_prov.get())]
             ent_custom.state(["!disabled"] if key == "custom" else ["disabled"])
             cb_mode.state(["disabled"] if key == "system" else ["!disabled", "readonly"])
+            chk_fallback.state(["disabled"] if key == "system" else ["!disabled"])
         cb_prov.bind("<<ComboboxSelected>>", sync_state)
         sync_state()
 
@@ -807,6 +818,7 @@ class App(tk.Tk):
                 "dns_provider": prov_keys[prov_labels.index(var_prov.get())],
                 "dns_mode": mode_keys[mode_labels.index(var_mode.get())],
                 "dns_custom": var_custom.get().strip(),
+                "dns_fallback": bool(var_fallback.get()),
             }
 
         var_result = tk.StringVar(value="")

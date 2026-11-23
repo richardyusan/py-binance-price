@@ -136,18 +136,70 @@ def _query_dot(server: str, name: str, timeout: float) -> tuple[list[str], int]:
 _QUERY_FN = {"doh": _query_doh, "dot": _query_dot, "udp": _query_udp}
 
 
+# Public encrypted resolvers tried, in this order, when the chosen one is
+# unreachable (office / campus firewalls often block 1.1.1.1 and 8.8.8.8).
+FALLBACK_PROVIDERS = ["cloudflare", "quad9", "adguard", "opendns", "google"]
+
+
+def _race(candidates, host: str, timeout: float):
+    """Query all (label, server, mode, delay) candidates in parallel; each
+    starts after its `delay` seconds unless another has already answered.
+
+    Returns (ips, ttl, label, server, mode) from the first that answers, or
+    raises OSError listing every failure."""
+    if not candidates:
+        raise OSError("no DNS servers to query")
+    done = threading.Event()
+    lock = threading.Lock()
+    result: list = []
+    errors: list[str] = []
+    remaining = [len(candidates)]
+
+    def run(label, server, mode, delay):
+        try:
+            if delay and done.wait(delay):
+                return
+            ips, ttl = _QUERY_FN[mode](server, host, timeout)
+            with lock:
+                if not result:
+                    result.append((ips, ttl, label, server, mode))
+            done.set()
+        except Exception as e:
+            with lock:
+                errors.append(f"{server}/{mode}: {e}")
+        finally:
+            with lock:
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    done.set()
+
+    for c in candidates:
+        threading.Thread(target=run, args=c, daemon=True).start()
+    done.wait(max(c[3] for c in candidates) + timeout * 2 + 1)
+    with lock:
+        if result:
+            return result[0]
+        raise OSError("; ".join(errors) or "timed out")
+
+
 class Resolver:
-    """Thread-safe resolver with a TTL cache."""
+    """Thread-safe resolver with a TTL cache.
+
+    With `fallback` on, a blocked encrypted provider is replaced by the first
+    other public provider that answers, and that one is used from then on."""
 
     def __init__(self, provider: str = "cloudflare", mode: str = "doh",
-                 custom_servers: list[str] | None = None, timeout: float = 4.0):
+                 custom_servers: list[str] | None = None, timeout: float = 4.0,
+                 fallback: bool = True):
         self.provider = provider if provider in DNS_PROVIDERS else "cloudflare"
         self.mode = mode if mode in DNS_MODES else "doh"
         self.timeout = timeout
+        self.fallback = fallback and self.mode != "udp" and self.provider != "system"
         if self.provider == "custom":
             self.servers = [s.strip() for s in (custom_servers or []) if s.strip()]
         else:
             self.servers = list(DNS_PROVIDERS[self.provider][1])
+        self.active: str | None = None   # fallback provider in use, if any
         self._cache: dict[str, tuple[list[str], float, str]] = {}
         self._lock = threading.Lock()
 
@@ -158,8 +210,15 @@ class Resolver:
             return name
         servers = ", ".join(self.servers) or "(none)"
         if self.provider == "custom":
-            return f"{servers} ({MODE_SHORT[self.mode]})"
-        return f"{name} {servers} ({MODE_SHORT[self.mode]})"
+            text = f"{servers} ({MODE_SHORT[self.mode]})"
+        else:
+            text = f"{name} {servers} ({MODE_SHORT[self.mode]})"
+        return text + (" + auto fallback" if self.fallback else "")
+
+    def _candidates(self, provider: str):
+        name = DNS_PROVIDERS[provider][0] if provider != "custom" else "Custom"
+        servers = self.servers if provider == self.provider else DNS_PROVIDERS[provider][1]
+        return [(name, s, m) for m in MODE_ORDER[self.mode] for s in servers]
 
     def resolve(self, host: str) -> tuple[list[str], str]:
         """Return (ips, how) where `how` describes which server answered."""
@@ -179,23 +238,33 @@ class Resolver:
             ips = list(dict.fromkeys(i[4][0] for i in infos))
             ttl, how = 60, "System DNS"
         else:
-            errors = []
-            ips = None
-            for mode in MODE_ORDER[self.mode]:
-                for server in self.servers:
-                    try:
-                        ips, ttl = _QUERY_FN[mode](server, host, self.timeout)
-                        how = f"{DNS_PROVIDERS[self.provider][0]} {server} ({MODE_SHORT[mode]})"
-                        break
-                    except Exception as e:
-                        errors.append(f"{server}/{mode}: {e}")
-                if ips:
-                    break
-            if not ips:
-                raise OSError(f"DNS lookup for {host} failed: " + "; ".join(errors))
+            ips, ttl, how = self._resolve_encrypted(host)
         with self._lock:
             self._cache[host] = (ips, now + ttl, how)
         return ips, how
+
+    # Seconds the preferred provider gets before the fallbacks join the race.
+    HEAD_START = 1.5
+
+    def _resolve_encrypted(self, host: str):
+        # The provider that worked last (the chosen one, or a fallback) goes
+        # first; if it hasn't answered after HEAD_START, every other public
+        # encrypted resolver joins the race and the first real answer wins.
+        first = self.active or self.provider
+        cands = [c + (0.0, first) for c in self._candidates(first)]
+        if self.fallback:
+            for p in dict.fromkeys([self.provider] + FALLBACK_PROVIDERS):
+                if p != first:
+                    cands += [c + (self.HEAD_START, p) for c in self._candidates(p)]
+        owner = {(c[1], c[2]): c[4] for c in reversed(cands)}
+        try:
+            ips, ttl, name, server, mode = _race([c[:4] for c in cands], host, self.timeout)
+        except OSError as e:
+            raise OSError(f"DNS lookup for {host} failed: {e}") from None
+        used = owner[(server, mode)]
+        self.active = None if used == self.provider else used
+        tag = " (fallback)" if self.active else ""
+        return ips, ttl, f"{name} {server} ({MODE_SHORT[mode]}){tag}"
 
     def invalidate(self, host: str):
         with self._lock:
@@ -445,10 +514,16 @@ class ChartWorker(_Worker):
 if __name__ == "__main__":  # quick manual test: py net.py
     for key in ("cloudflare", "google", "quad9", "adguard", "opendns"):
         for mode in ("doh", "dot", "udp"):
-            r = Resolver(key, mode)
+            r = Resolver(key, mode, fallback=False)
             t = time.perf_counter()
             try:
                 ips, how = r.resolve("api.binance.com")
                 print(f"{key:10} {mode}: {ips[:2]} via {how}  {1000 * (time.perf_counter() - t):.0f} ms")
             except Exception as e:
                 print(f"{key:10} {mode}: FAIL {e}")
+    r = Resolver()  # defaults: Cloudflare DoH with auto fallback
+    for i in range(2):
+        t = time.perf_counter()
+        ips, how = r.resolve("api.binance.com")
+        r.invalidate("api.binance.com")
+        print(f"default #{i + 1}: {ips[:2]} via {how}  {1000 * (time.perf_counter() - t):.0f} ms")
